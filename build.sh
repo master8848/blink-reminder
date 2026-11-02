@@ -6,7 +6,7 @@ APP_BUNDLE="$APP_NAME.app"
 CONTENTS="$APP_BUNDLE/Contents"
 MACOS="$CONTENTS/MacOS"
 RESOURCES="$CONTENTS/Resources"
-VERSION="${1:-1.1.4}"
+VERSION="${1:-1.1.5}"
 MIN_OS="13.0"
 SDK_PATH="$(xcrun --show-sdk-path --sdk macosx)"
 

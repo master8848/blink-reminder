@@ -130,6 +130,36 @@ checkEqual(shouldSkipBreakForIdle(manual: false, resetOnIdle: true, idleSeconds:
 checkEqual(shouldSkipBreakForIdle(manual: false, resetOnIdle: false, idleSeconds: 3600, threshold: 60), false, "idle reset off does not skip")
 checkEqual(shouldSkipBreakForIdle(manual: true, resetOnIdle: true, idleSeconds: 3600, threshold: 60), false, "manual never skips")
 
+// 6. Snooze = delay-from-now, never interval+delay (death-by-1000-cuts fix).
+// Mirrors deferBreak(by:) → startTimer(withDelay: extra): next fire is
+// now+extra, independent of the running interval.
+func snoozeFireDate(now: Date, extra: TimeInterval) -> Date {
+    now.addingTimeInterval(max(1, extra))
+}
+let snoozeNow = Date()
+checkEqual(snoozeFireDate(now: snoozeNow, extra: 300), snoozeNow.addingTimeInterval(300), "snooze +5m fires 300s from now")
+check(snoozeFireDate(now: snoozeNow, extra: 300) != snoozeNow.addingTimeInterval(1200 + 300), "snooze is not interval+delay")
+
+// 7. Next cycle arms on dismissal (completion), not at fire time.
+// Pure invariant: completion reschedules the full interval from dismissal.
+func nextFireAfterCompletion(dismissedAt: Date, interval: TimeInterval) -> Date {
+    dismissedAt.addingTimeInterval(max(1, interval))
+}
+let doneAt = Date()
+checkEqual(nextFireAfterCompletion(dismissedAt: doneAt, interval: 1200), doneAt.addingTimeInterval(1200), "completion reschedules full interval from dismiss")
+
+// 8. Countdown fallback: no-schedule while unpaused must not lie "Paused".
+// Mirrors countdownTitle(): paused states win, mid-break shows On break,
+// otherwise a nil fire date renders a neutral placeholder.
+func resolveCountdownFallback(isPaused: Bool, overlayShowing: Bool, hasFireDate: Bool) -> String {
+    if isPaused { return "Paused" }
+    if overlayShowing { return "On break…" }
+    return hasFireDate ? "dated" : "Next break in --:--"
+}
+checkEqual(resolveCountdownFallback(isPaused: false, overlayShowing: true, hasFireDate: false), "On break…", "mid-break shows On break")
+checkEqual(resolveCountdownFallback(isPaused: false, overlayShowing: false, hasFireDate: false), "Next break in --:--", "no-schedule shows placeholder not Paused")
+checkEqual(resolveCountdownFallback(isPaused: true, overlayShowing: true, hasFireDate: false), "Paused", "pause wins over break display")
+
 // MARK: - Result
 
 if failures > 0 {

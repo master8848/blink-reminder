@@ -59,6 +59,7 @@ enum AppDefaults {
     static let breakDuration = "BreakDuration"
     static let interval = "BreakInterval"
     static let overlayEnabled = "OverlayEnabled"
+    static let soundEnabled = "SoundEnabled"
 
     static func register() {
         UserDefaults.standard.register(defaults: [
@@ -77,7 +78,38 @@ enum AppDefaults {
             breakDuration: 20.0,
             interval: 20 * 60,
             overlayEnabled: true,
+            soundEnabled: true,
         ])
+    }
+}
+
+// MARK: - Break sounds (system sounds only, no new deps)
+
+/// Plays short system alert sounds for break events. NSSound is AppKit
+/// (already imported). Single choke point for the user toggle + main-thread
+/// hop so call sites stay one-liners. Never crashes headless (nil → log).
+enum BreakSound {
+    private static var retained: NSSound?
+
+    static func play(named name: String, reason: String) {
+        guard UserDefaults.standard.bool(forKey: AppDefaults.soundEnabled) else { return }
+        guard Thread.isMainThread else {
+            DispatchQueue.main.async { play(named: name, reason: reason) }
+            return
+        }
+        let sound: NSSound? = NSSound(named: name)
+            ?? NSSound(contentsOfFile: "/System/Library/Sounds/\(name).aiff", byReference: true)
+        guard let sound else {
+            logger.error("Break sound missing: \(name) (\(reason))")
+            return
+        }
+        // Retain: a local would deallocate mid-play and truncate the audio.
+        retained = sound
+        if sound.play() {
+            logger.info("Playing sound: \(name) (\(reason))")
+        } else {
+            logger.error("Break sound play failed: \(name) (\(reason))")
+        }
     }
 }
 
@@ -396,6 +428,10 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate, UNUser
         motivationItem.state = UserDefaults.standard.bool(forKey: AppDefaults.motivationEnabled) ? .on : .off
         settingsSub.addItem(motivationItem)
 
+        let soundItem = NSMenuItem(title: "Play Sounds", action: #selector(toggleSound(_:)), keyEquivalent: "")
+        soundItem.state = UserDefaults.standard.bool(forKey: AppDefaults.soundEnabled) ? .on : .off
+        settingsSub.addItem(soundItem)
+
         settingsSub.addItem(NSMenuItem.separator())
         let langHeader = NSMenuItem(title: "Languages:", action: nil, keyEquivalent: "")
         langHeader.isEnabled = false
@@ -565,6 +601,17 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate, UNUser
         sender.state = !current ? .on : .off
     }
 
+    @objc func toggleSound(_ sender: NSMenuItem) {
+        let current = UserDefaults.standard.bool(forKey: AppDefaults.soundEnabled)
+        UserDefaults.standard.set(!current, forKey: AppDefaults.soundEnabled)
+        sender.state = !current ? .on : .off
+        logger.info("SoundEnabled set to \(!current)")
+        // Immediate feedback when turning on.
+        if !current {
+            BreakSound.play(named: "Pop", reason: "sound-toggle-test")
+        }
+    }
+
     @objc func toggleLanguage(_ sender: NSMenuItem) {
         guard let key = sender.representedObject as? String else { return }
         let current = UserDefaults.standard.bool(forKey: key)
@@ -643,9 +690,10 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate, UNUser
 
     /// Restarts the schedule when a timed pause just expired and nothing is
     /// running. Call after refreshManualPauseIfExpired() on paths that don't
-    /// otherwise start the timer.
+    /// otherwise start the timer. Never arms underneath a live overlay —
+    /// the overlay owns the next cycle and arms it on dismissal.
     func resumeScheduleIfPauseExpired(_ expired: Bool) {
-        if expired, !isPaused, timer == nil {
+        if expired, !isPaused, timer == nil, overlayWindows.isEmpty {
             startTimer()
         }
     }
@@ -671,7 +719,12 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate, UNUser
             }
             return "Paused"
         }
-        guard let nextFireDate else { return "Paused" }
+        // Mid-break the next cycle arms on dismissal, so there is no
+        // nextFireDate yet — show break state, not a misleading "Paused".
+        if !overlayWindows.isEmpty {
+            return "On break…"
+        }
+        guard let nextFireDate else { return "Next break in --:--" }
         let remaining = max(0, Int(ceil(nextFireDate.timeIntervalSinceNow)))
         let minutes = remaining / 60
         let seconds = remaining % 60
@@ -711,6 +764,8 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate, UNUser
                 switch item.title {
                 case "Enable Motivation Text":
                     item.state = UserDefaults.standard.bool(forKey: AppDefaults.motivationEnabled) ? .on : .off
+                case "Play Sounds":
+                    item.state = UserDefaults.standard.bool(forKey: AppDefaults.soundEnabled) ? .on : .off
                 case "English":
                     item.state = UserDefaults.standard.bool(forKey: AppDefaults.langEnglish) ? .on : .off
                 case "Hindi":
@@ -891,15 +946,43 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate, UNUser
         }
         clearHeadsUpState()
         if overlayEnabled {
+            // Consume the fired cycle: cancel the pending single-shot so the
+            // menu doesn't show a stale countdown mid-break. The NEXT cycle
+            // arms on dismissal (rescheduleAfterBreak), i.e. a full interval
+            // AFTER the break completes — not interval-minus-20s from its start.
+            timer?.invalidate()
+            timer = nil
+            headsUpTimer?.invalidate()
+            headsUpTimer = nil
+            nextFireDate = nil
+            refreshCountdownItem()
             logger.info("triggerBreak: presenting overlay")
             showOverlay()
+            // Headless fallback: no screens → no dismissal will ever come,
+            // so don't leave the app timer-less.
+            if overlayWindows.isEmpty {
+                logger.error("Overlay failed to present, rescheduling")
+                startTimer()
+            }
         } else {
             logger.info("triggerBreak: overlay disabled, sending notification")
             sendNotification()
+            // No overlay to dismiss, so the next cycle starts at fire time.
+            startTimer()
         }
-        // Schedule the next cycle AFTER the overlay exists (showOverlay is
-        // synchronous on the main thread). startTimer only touches
-        // timer/headsUpTimer/nextFireDate — it never invalidates overlayWindows.
+        updateMenuStates()
+    }
+
+    /// Arms the next full interval after a break completes (natural expiry or
+    /// Skip). Snooze/pause/camera paths schedule differently or not at all,
+    /// so they dismiss with scheduleNext:false instead of coming here.
+    func rescheduleAfterBreak() {
+        guard !isPaused else {
+            logger.info("Break ended while paused — no reschedule")
+            updateMenuStates()
+            return
+        }
+        logger.info("Break completed — next break in \(Int(self.interval))s")
         startTimer()
         updateMenuStates()
     }
@@ -977,8 +1060,9 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate, UNUser
         lastHeadsUpID = nil
     }
 
-    /// Pushes the next break `extra` seconds into the future and restarts the
-    /// single-shot timer. Snooze means "come back in X", not "add X on top".
+    /// Snooze means "come back in X from NOW" — the next fire is now+extra,
+    /// never interval+extra. Invalidates any pending cycle and arms exactly
+    /// `extra` (clamped >= 1s by startTimer).
     func deferBreak(by extra: TimeInterval) {
         if !Thread.isMainThread {
             DispatchQueue.main.async { [weak self] in self?.deferBreak(by: extra) }
@@ -991,15 +1075,30 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate, UNUser
             updateMenuStates()
             return
         }
+        // Stale heads-up tap arriving while an overlay is up: close it first
+        // (without arming a full interval) so the snooze isn't overwritten
+        // when the overlay later dismisses.
+        if !overlayWindows.isEmpty {
+            logger.info("Deferring with overlay showing — dismissing first")
+            dismissOverlayAndRestoreFocus(scheduleNext: false)
+        }
         clearHeadsUpState()
-        logger.info("Deferring break by \(Int(extra))s")
+        logger.info("Deferring break by \(Int(extra))s (next fire in \(Int(extra))s, not interval+\(Int(extra))s)")
         startTimer(withDelay: extra)
         updateMenuStates()
     }
 
-    /// Overlay snooze button: dismiss now, come back in 5 minutes.
+    /// Overlay snooze button: dismiss now, come back in 5 minutes from now.
     func snoozeBreakForFiveMinutes() {
-        dismissOverlayAndRestoreFocus()
+        // Check pause BEFORE dismissing: otherwise the overlay vanishes and
+        // the snooze is dropped — the worst outcome (no break, no timer).
+        guard !isPaused else {
+            logger.warning("Overlay snooze ignored: app is paused (overlay stays up)")
+            updateMenuStates()
+            return
+        }
+        BreakSound.play(named: "Pop", reason: "snooze")
+        dismissOverlayAndRestoreFocus(scheduleNext: false)
         deferBreak(by: 5 * 60)
     }
 
@@ -1087,7 +1186,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate, UNUser
         isAutoPausedForVideoCall = isCameraRunning
         if isAutoPausedForVideoCall {
             logger.info("Camera in use — auto-pausing breaks")
-            dismissOverlayAndRestoreFocus()
+            dismissOverlayAndRestoreFocus(scheduleNext: false)
         } else {
             logger.info("Camera released — resuming breaks")
         }
@@ -1169,13 +1268,27 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate, UNUser
             headsUpTimer = nil
             nextFireDate = nil
             clearHeadsUpState()
-            dismissOverlayAndRestoreFocus()
-        } else {
+            dismissOverlayAndRestoreFocus(scheduleNext: false)
+        } else if overlayWindows.isEmpty {
             startTimer()
+        } else {
+            // Live overlay owns the next cycle (arms on dismissal) — don't
+            // arm a concurrent timer underneath it (e.g. wake during a break).
+            refreshCountdownItem()
         }
 
         updateStatusIcon()
         updateMenuStates()
+    }
+
+    /// Natural countdown expiry: completion chime once, then dismiss +
+    /// reschedule. The hadOverlay check dedupes N-screen expiry (each screen's
+    /// view crosses zero in the same second; only the winner chimes).
+    func completeBreakNaturally() {
+        if !overlayWindows.isEmpty {
+            BreakSound.play(named: "Hero", reason: "break-end")
+        }
+        dismissOverlayAndRestoreFocus()
     }
 
     func updateStatusIcon() {
@@ -1201,12 +1314,19 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate, UNUser
     /// Closes every overlay window and returns keyboard focus to the app the
     /// user was in before the break — like Time Out / Stretchly / Big Stretch do.
     /// Safe to call multiple times and from any overlay dismissal path.
-    func dismissOverlayAndRestoreFocus() {
+    /// When scheduleNext is true (natural expiry / Skip), arms the next full
+    /// interval after completion. Snooze, pause, and camera paths pass false
+    /// because they schedule differently (5m) or not at all (paused).
+    func dismissOverlayAndRestoreFocus(scheduleNext: Bool = true) {
         if !Thread.isMainThread {
-            DispatchQueue.main.async { [weak self] in self?.dismissOverlayAndRestoreFocus() }
+            DispatchQueue.main.async { [weak self] in self?.dismissOverlayAndRestoreFocus(scheduleNext: scheduleNext) }
             return
         }
         guard !overlayWindows.isEmpty || previouslyActiveApp != nil else { return }
+
+        // Multi-screen safety: N views cross zero in the same second and all
+        // call onDismiss. Only the first (non-empty) call may reschedule.
+        let hadOverlay = !overlayWindows.isEmpty
 
         logger.info("Dismissing \(self.overlayWindows.count) overlay window(s)")
         // Release the SwiftUI hosting views before closing: close() alone may
@@ -1245,11 +1365,18 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate, UNUser
             }
             NSApp.hide(nil)
         }
+
+        // Next cycle arms HERE (completion), not at fire time: a full interval
+        // after the user returns. Guarded so pause/camera/snooze dismissals
+        // (scheduleNext:false) and duplicate multi-screen calls never restart.
+        if scheduleNext, hadOverlay {
+            rescheduleAfterBreak()
+        }
     }
 
     /// Presents the break overlay. Runs synchronously when already on the main
-    /// thread so the windows exist before triggerBreak() schedules the next
-    /// cycle; hops to main only when called from a background thread.
+    /// thread; hops to main only when called from a background thread.
+    /// (The next cycle arms on dismissal, not here — see handleBreakFire.)
     func showOverlay() {
         if Thread.isMainThread {
             presentOverlayNow()
@@ -1303,11 +1430,13 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate, UNUser
             let window = OverlayWindow(frame: screen.frame)
             let view = OverlayView(
                 onDismiss: { [weak self] in self?.dismissOverlayAndRestoreFocus() },
+                onNaturalEnd: { [weak self] in self?.completeBreakNaturally() },
                 onSkipAction: { [weak self] in
                     self?.skipTimestamps.append(Date())
                     if let self {
                         logger.info("Skip recorded (\(self.skipTimestamps.count) this hour window)")
                     }
+                    BreakSound.play(named: "Bottle", reason: "skip")
                 },
                 onSnoozeAction: { [weak self] in self?.snoozeBreakForFiveMinutes() },
                 quotes: breakQuotes,
@@ -1326,6 +1455,8 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate, UNUser
         logger.info("Overlay shown on \(self.overlayWindows.count) window(s)")
         if self.overlayWindows.isEmpty {
             logger.error("showOverlay: no overlay windows created despite \(screenCount) screen(s)")
+        } else {
+            BreakSound.play(named: "Glass", reason: "break-start")
         }
     }
 
@@ -1380,6 +1511,9 @@ private struct ProgressRing: View {
 
 struct OverlayView: View {
     var onDismiss: () -> Void
+    /// Natural countdown expiry (plays the completion chime). Skip uses
+    /// onSkipAction + onDismiss so it gets its own dismiss sound instead.
+    var onNaturalEnd: () -> Void
     var onSkipAction: () -> Void
     var onSnoozeAction: () -> Void
     var quotes: [String]
@@ -1510,10 +1644,10 @@ struct OverlayView: View {
                 timeLeft = left
                 logger.debug("Overlay countdown: \(left)s left")
                 if left <= 0 {
-                    onDismiss()
+                    onNaturalEnd()
                 }
             } else {
-                onDismiss()
+                onNaturalEnd()
             }
         }
     }

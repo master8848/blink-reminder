@@ -11,6 +11,10 @@ Verify each item on a real Mac before shipping a release build.
 - [ ] After auto-dismiss, keyboard focus returns to the previously active app.
 - [ ] Skip button dismisses the overlay and records a skip.
 - [ ] Snooze +5m dismisses and the next break fires ~5 minutes later (not interval+5m).
+- [ ] Manual Trigger Break Now resets the full interval AFTER the break completes
+      (menu shows "On break…" mid-break, then "Next break in 20:00").
+- [ ] Break start plays a chime, natural completion plays a done sound;
+      Skip/Snooze play their own confirm sounds; Settings > Play Sounds toggles all.
 - [ ] Heads-up +1m / +5m actions defer by the stated amount from now.
 - [ ] Strict Mode hides Skip/Snooze buttons ("Strict Mode On" shown).
 - [ ] Max Skips reached shows "Skip Limit Reached" and hides buttons.
@@ -20,6 +24,8 @@ Verify each item on a real Mac before shipping a release build.
 - [ ] Menu bar shows the eye icon only; countdown appears in the opened menu.
 - [ ] Menu shows "Next break in MM:SS" snapshot when opened.
 - [ ] Menu shows "Paused" / "Paused (Xm left)" / "Paused (Video Call)" correctly.
+- [ ] Menu shows "On break…" while the overlay is up (not "Paused";
+      pause wins if both, e.g. paused snooze leaves the overlay up).
 - [ ] Pause / Resume toggles the schedule.
 - [ ] Pause For > 15m / 30m / 1h pauses and auto-resumes after the duration.
 - [ ] Changing Interval restarts the countdown.
