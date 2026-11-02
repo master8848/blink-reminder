@@ -10,7 +10,8 @@ Verify each item on a real Mac before shipping a release build.
 - [ ] Countdown runs 20 → 0 (or configured duration) then auto-dismisses.
 - [ ] After auto-dismiss, keyboard focus returns to the previously active app.
 - [ ] Skip button dismisses the overlay and records a skip.
-- [ ] Snooze +5m dismisses and the next break fires ~5 minutes later.
+- [ ] Snooze +5m dismisses and the next break fires ~5 minutes later (not interval+5m).
+- [ ] Heads-up +1m / +5m actions defer by the stated amount from now.
 - [ ] Strict Mode hides Skip/Snooze buttons ("Strict Mode On" shown).
 - [ ] Max Skips reached shows "Skip Limit Reached" and hides buttons.
 - [ ] Overlay appears above a fullscreen app.
@@ -26,7 +27,8 @@ Verify each item on a real Mac before shipping a release build.
 
 ## Sensors
 - [ ] Camera on pauses the timer ("Paused (Video Call)"); camera off resumes.
-- [ ] Idle past the threshold resets the timer (no overlay on an empty desk).
+- [ ] Idle past the threshold resets the timer only when "Reset Timer When Idle"
+      is enabled (off by default); no overlay on an empty desk when enabled.
 - [ ] Sleep suspends, wake resumes the schedule.
 
 ## Notifications

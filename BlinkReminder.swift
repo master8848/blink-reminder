@@ -68,7 +68,9 @@ enum AppDefaults {
             strictMode: false,
             maxSkipsPerHour: -1, // -1 = Unlimited
             autoPauseForCamera: true,
-            resetOnIdle: true,
+            // Off by default: the idle API misreports on some systems, where a
+            // default-on reset silently eats every break. Opt in via Advanced.
+            resetOnIdle: false,
             idleThreshold: 60.0,
             breakDuration: 20.0,
         ])
@@ -900,17 +902,16 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate, UNUser
         lastHeadsUpID = nil
     }
 
-    /// Pushes nextFireDate into the future and restarts the single-shot timer.
+    /// Pushes the next break `extra` seconds into the future and restarts the
+    /// single-shot timer. Snooze means "come back in X", not "add X on top".
     func deferBreak(by extra: TimeInterval) {
         if !Thread.isMainThread {
             DispatchQueue.main.async { [weak self] in self?.deferBreak(by: extra) }
             return
         }
         clearHeadsUpState()
-        let remaining = nextFireDate?.timeIntervalSinceNow ?? interval
-        let newDelay = max(extra, remaining + extra)
-        logger.info("Deferring break by \(Int(extra))s (new delay \(Int(newDelay))s)")
-        startTimer(withDelay: newDelay)
+        logger.info("Deferring break by \(Int(extra))s")
+        startTimer(withDelay: extra)
         updateMenuStates()
     }
 

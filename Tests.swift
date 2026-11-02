@@ -29,9 +29,22 @@ func formatCountdownTitle(remaining: Int) -> String {
     return String(format: "Next break in %02d:%02d", minutes, seconds)
 }
 
-/// Mirrors AppDelegate.deferBreak(by:) delay computation.
-func deferNewDelay(remaining: TimeInterval, extra: TimeInterval) -> TimeInterval {
-    max(extra, remaining + extra)
+/// Mirrors AppDelegate.deferBreak(by:) delay computation: snooze means the
+/// next break comes `extra` seconds from now (startTimer clamps to >= 1s).
+func deferNewDelay(extra: TimeInterval) -> TimeInterval {
+    max(1, extra)
+}
+
+/// Mirrors AppDelegate.remainingManualPauseText() ("Xm left" rounding).
+func remainingPauseText(remaining: TimeInterval) -> String? {
+    guard remaining > 0 else { return nil }
+    return "\(Int(ceil(remaining / 60.0)))m left"
+}
+
+/// Mirrors AppDelegate.refreshManualPauseIfExpired() expiry decision.
+func isPauseExpired(now: Date, until: Date?) -> Bool {
+    guard let until else { return false }
+    return now >= until
 }
 
 /// Mirrors the 1-hour skip-window filter in showOverlay().
@@ -68,11 +81,24 @@ checkEqual(formatCountdownTitle(remaining: 65), "Next break in 01:05", "countdow
 checkEqual(formatCountdownTitle(remaining: 3600), "Next break in 60:00", "countdown 3600s")
 checkEqual(formatCountdownTitle(remaining: -5), "Next break in 00:00", "countdown clamps negative")
 
-// 2. deferBreak: newDelay = max(extra, remaining+extra).
-checkEqual(deferNewDelay(remaining: 100, extra: 60), 160, "defer adds to remaining")
-checkEqual(deferNewDelay(remaining: -10, extra: 60), 60, "defer overdue clamps to extra")
-checkEqual(deferNewDelay(remaining: 0, extra: 300), 300, "defer zero remaining")
-checkEqual(deferNewDelay(remaining: 500, extra: 300), 800, "defer large remaining")
+// 2. deferBreak: next break comes `extra` seconds from now.
+checkEqual(deferNewDelay(extra: 60), 60, "defer +1m means 60s from now")
+checkEqual(deferNewDelay(extra: 300), 300, "defer +5m means 300s from now")
+checkEqual(deferNewDelay(extra: 0), 1, "defer clamps to >= 1s")
+
+// 2b. Pause For: "Xm left" rounding + expiry decision.
+checkEqual(remainingPauseText(remaining: 900), "15m left", "pause 15m")
+checkEqual(remainingPauseText(remaining: 1800), "30m left", "pause 30m")
+checkEqual(remainingPauseText(remaining: 3600), "60m left", "pause 1h")
+checkEqual(remainingPauseText(remaining: 59), "1m left", "pause rounds up partial minute")
+checkEqual(remainingPauseText(remaining: 61), "2m left", "pause rounds up 61s")
+checkEqual(remainingPauseText(remaining: 0), nil, "pause ended shows nothing")
+checkEqual(remainingPauseText(remaining: -5), nil, "pause overdue shows nothing")
+let ref = Date()
+checkEqual(isPauseExpired(now: ref, until: ref), true, "pause expires exactly at deadline")
+checkEqual(isPauseExpired(now: ref.addingTimeInterval(1), until: ref), true, "pause expires past deadline")
+checkEqual(isPauseExpired(now: ref.addingTimeInterval(-1), until: ref), false, "pause active before deadline")
+checkEqual(isPauseExpired(now: ref, until: nil), false, "no schedule never expires")
 
 // 3. Skip-window filter (<3600s) + canSkip vs maxSkips (-1/0/1/3/5).
 let now = Date()
