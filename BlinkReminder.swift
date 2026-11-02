@@ -57,6 +57,8 @@ enum AppDefaults {
     static let resetOnIdle = "ResetOnIdle"
     static let idleThreshold = "IdleThreshold"
     static let breakDuration = "BreakDuration"
+    static let interval = "BreakInterval"
+    static let overlayEnabled = "OverlayEnabled"
 
     static func register() {
         UserDefaults.standard.register(defaults: [
@@ -73,6 +75,8 @@ enum AppDefaults {
             resetOnIdle: false,
             idleThreshold: 60.0,
             breakDuration: 20.0,
+            interval: 20 * 60,
+            overlayEnabled: true,
         ])
     }
 }
@@ -166,6 +170,8 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate, UNUser
     var skipTimestamps: [Date] = []
     var nextFireDate: Date?
     var lastHeadsUpID: String?
+    /// Remaining countdown preserved across sleep/wake (nil = no suspend).
+    var suspendedRemaining: TimeInterval?
 
     var isManuallyPaused = false
     var isAutoPausedForVideoCall = false
@@ -201,6 +207,14 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate, UNUser
     func applicationDidFinishLaunching(_ notification: Notification) {
         UNUserNotificationCenter.current().delegate = self
         AppDefaults.register()
+
+        // Restore persisted preferences (in-memory defaults would silently
+        // reset the user's choices on every relaunch).
+        let storedInterval = UserDefaults.standard.double(forKey: AppDefaults.interval)
+        if storedInterval > 0 {
+            interval = storedInterval
+        }
+        overlayEnabled = UserDefaults.standard.bool(forKey: AppDefaults.overlayEnabled)
 
         if UserDefaults.standard.bool(forKey: AppDefaults.firstRun) {
             enableLaunchAtLogin()
@@ -253,7 +267,10 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate, UNUser
         manualPauseResumeTimer?.invalidate()
         manualPauseResumeTimer = nil
         nextFireDate = nil
-        overlayWindows.forEach { $0.close() }
+        overlayWindows.forEach {
+            $0.contentView = nil
+            $0.close()
+        }
         overlayWindows.removeAll()
         previouslyActiveApp = nil
         if let statusItem {
@@ -284,7 +301,9 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate, UNUser
                 logger.info("Heads-up: snooze +5m")
                 self.deferBreak(by: 5 * 60)
             default:
-                break
+                // Banner tapped directly or dismissed: drop the stale heads-up
+                // ID so a later break can't clear the wrong notification.
+                self.clearHeadsUpState()
             }
             completionHandler()
         }
@@ -292,8 +311,8 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate, UNUser
 
     func setupNotificationCategories() {
         let startNow = UNNotificationAction(identifier: HeadsUp.startNowID, title: "Start now", options: [])
-        let snooze1m = UNNotificationAction(identifier: HeadsUp.snooze1mID, title: "+1m", options: [])
-        let snooze5m = UNNotificationAction(identifier: HeadsUp.snooze5mID, title: "+5m", options: [])
+        let snooze1m = UNNotificationAction(identifier: HeadsUp.snooze1mID, title: "Snooze 1 min", options: [])
+        let snooze5m = UNNotificationAction(identifier: HeadsUp.snooze5mID, title: "Snooze 5 min", options: [])
         let category = UNNotificationCategory(identifier: HeadsUp.categoryID, actions: [startNow, snooze1m, snooze5m], intentIdentifiers: [], options: [])
         UNUserNotificationCenter.current().setNotificationCategories([category])
     }
@@ -400,7 +419,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate, UNUser
         let skipsItem = NSMenuItem(title: "Max Skips / Hour", action: nil, keyEquivalent: "")
         let skipsSub = NSMenu()
         let currentMaxSkips = UserDefaults.standard.integer(forKey: AppDefaults.maxSkipsPerHour)
-        for (title, val) in [("Strict (0)", 0), ("1 Skip", 1), ("3 Skips", 3), ("5 Skips", 5), ("Unlimited", -1)] {
+        for (title, val) in [("No skips (0)", 0), ("1 Skip", 1), ("3 Skips", 3), ("5 Skips", 5), ("Unlimited", -1)] {
             let item = NSMenuItem(title: title, action: #selector(changeMaxSkips(_:)), keyEquivalent: "")
             item.tag = val
             item.state = (val == currentMaxSkips) ? .on : .off
@@ -479,6 +498,8 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate, UNUser
         }
         guard let newInterval, newInterval > 0 else { return }
         interval = newInterval
+        UserDefaults.standard.set(newInterval, forKey: AppDefaults.interval)
+        logger.info("Interval set to \(Int(newInterval))s")
         startTimer()
         updateMenuStates()
     }
@@ -499,6 +520,8 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate, UNUser
 
     @objc func toggleOverlay(_ sender: NSMenuItem) {
         overlayEnabled.toggle()
+        UserDefaults.standard.set(overlayEnabled, forKey: AppDefaults.overlayEnabled)
+        logger.info("OverlayEnabled set to \(self.overlayEnabled)")
         updateMenuStates()
     }
 
@@ -562,9 +585,11 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate, UNUser
         if isManuallyPaused {
             clearManualPauseSchedule()
             isManuallyPaused = false
+            logger.info("Manually resumed")
         } else {
             clearManualPauseSchedule()
             isManuallyPaused = true
+            logger.info("Manually paused (indefinite)")
         }
         applyPauseState()
     }
@@ -573,6 +598,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate, UNUser
         clearManualPauseSchedule()
         isManuallyPaused = true
         manualPauseUntil = Date().addingTimeInterval(duration)
+        logger.info("Paused for \(Int(duration / 60))m")
 
         manualPauseResumeTimer = Timer.scheduledTimer(withTimeInterval: duration, repeats: false) { [weak self] _ in
             guard let self else { return }
@@ -581,7 +607,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate, UNUser
             self.applyPauseState()
         }
         if let manualPauseResumeTimer {
-            RunLoop.current.add(manualPauseResumeTimer, forMode: .common)
+            RunLoop.main.add(manualPauseResumeTimer, forMode: .common)
         }
         applyPauseState()
     }
@@ -600,11 +626,27 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate, UNUser
         return "\(remainingMinutes)m left"
     }
 
-    func refreshManualPauseIfExpired() {
-        guard isManuallyPaused, let manualPauseUntil else { return }
+    /// Clears an expired timed pause. Returns true on the expiry transition so
+    /// callers can restart the schedule (otherwise the app sits unpaused with
+    /// no timer until some unrelated event fires).
+    @discardableResult
+    func refreshManualPauseIfExpired() -> Bool {
+        guard isManuallyPaused, let manualPauseUntil else { return false }
         if Date() >= manualPauseUntil {
             clearManualPauseSchedule()
             isManuallyPaused = false
+            logger.info("Timed pause expired, resuming schedule")
+            return true
+        }
+        return false
+    }
+
+    /// Restarts the schedule when a timed pause just expired and nothing is
+    /// running. Call after refreshManualPauseIfExpired() on paths that don't
+    /// otherwise start the timer.
+    func resumeScheduleIfPauseExpired(_ expired: Bool) {
+        if expired, !isPaused, timer == nil {
+            startTimer()
         }
     }
 
@@ -614,7 +656,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate, UNUser
     /// countdownTitle() computes from nextFireDate on demand, so no repeating
     /// 1s timer runs while the app idles.
     func menuWillOpen(_ menu: NSMenu) {
-        refreshManualPauseIfExpired()
+        resumeScheduleIfPauseExpired(refreshManualPauseIfExpired())
         refreshCountdownItem()
         updateMenuStates()
     }
@@ -725,6 +767,17 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate, UNUser
     }
 
     @objc func suspendTimer() {
+        if !Thread.isMainThread {
+            DispatchQueue.main.async { [weak self] in self?.suspendTimer() }
+            return
+        }
+        // Preserve remaining time so wake resumes where sleep left off
+        // instead of restarting a full interval. willSleep + screensDidSleep
+        // both fire: only capture when a schedule exists, never clobber.
+        if let nextFireDate {
+            let remaining = nextFireDate.timeIntervalSinceNow
+            suspendedRemaining = max(1, remaining)
+        }
         timer?.invalidate()
         timer = nil
         headsUpTimer?.invalidate()
@@ -736,7 +789,19 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate, UNUser
     }
 
     @objc func resumeTimer() {
+        if !Thread.isMainThread {
+            DispatchQueue.main.async { [weak self] in self?.resumeTimer() }
+            return
+        }
         refreshManualPauseIfExpired()
+        if !isPaused, let remaining = suspendedRemaining {
+            suspendedRemaining = nil
+            logger.info("Timer resumed (wake) with \(Int(remaining))s remaining")
+            startTimer(withDelay: remaining)
+            updateMenuStates()
+            return
+        }
+        suspendedRemaining = nil
         applyPauseState()
         logger.info("Timer resumed (wake)")
     }
@@ -773,7 +838,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate, UNUser
             self?.triggerBreak()
         }
         if let timer {
-            RunLoop.current.add(timer, forMode: .common)
+            RunLoop.main.add(timer, forMode: .common)
         }
         // 30s heads-up when there is room for one.
         if delay > HeadsUp.leadTime + 5 {
@@ -782,7 +847,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate, UNUser
                 self?.sendHeadsUp()
             }
             if let headsUpTimer {
-                RunLoop.current.add(headsUpTimer, forMode: .common)
+                RunLoop.main.add(headsUpTimer, forMode: .common)
             }
         }
         refreshCountdownItem()
@@ -803,6 +868,13 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate, UNUser
     private func handleBreakFire(manual: Bool) {
         refreshManualPauseIfExpired()
         if manual {
+            // Already showing: just bring it forward, don't tear down the
+            // active break or restart its countdown.
+            if !overlayWindows.isEmpty {
+                logger.info("Manual break trigger ignored: overlay already showing")
+                NSApp.activate(ignoringOtherApps: true)
+                return
+            }
             logger.info("Manual break trigger (paused/idle guards bypassed, idle=\(Int(self.idleSeconds()))s)")
         } else {
             guard !isPaused else {
@@ -834,8 +906,9 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate, UNUser
 
     /// Headless UI self-test (`--test-overlay`): presents the overlay via the
     /// manual path, reports windows/visible/screens to stdout, then quits.
-    /// Skips when there is no GUI session or the app is paused. Lets anyone
-    /// verify the overlay on a real Mac without build tools:
+    /// SKIP only when there is no GUI session. (Manual triggers bypass pause,
+    /// so paused state must NOT gate the verdict.)
+    /// Lets anyone verify the overlay on a real Mac without build tools:
     /// `/Applications/BlinkReminder.app/Contents/MacOS/BlinkReminder --test-overlay`
     func runOverlaySelfTest() {
         uitestLog("UI-TEST: starting overlay self-test")
@@ -843,8 +916,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate, UNUser
         DispatchQueue.main.asyncAfter(deadline: .now() + 1) { [weak self] in
             guard let self else { return }
             let screens = NSScreen.screens.count
-            let wasPaused = self.isPaused
-            uitestLog("UI-TEST: screens=\(screens) paused=\(wasPaused) overlayEnabled=\(self.overlayEnabled) idle=\(Int(self.idleSeconds()))s threshold=\(Int(self.idleThreshold))s resetOnIdle=\(UserDefaults.standard.bool(forKey: AppDefaults.resetOnIdle))")
+            uitestLog("UI-TEST: screens=\(screens) paused=\(self.isPaused) overlayEnabled=\(self.overlayEnabled) idle=\(Int(self.idleSeconds()))s threshold=\(Int(self.idleThreshold))s resetOnIdle=\(UserDefaults.standard.bool(forKey: AppDefaults.resetOnIdle))")
             self.triggerBreakNow()
             DispatchQueue.main.asyncAfter(deadline: .now() + 3) { [weak self] in
                 guard let self else { return }
@@ -853,8 +925,6 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate, UNUser
                 uitestLog("UI-TEST: windows=\(count) visible=\(visible)")
                 if screens == 0 {
                     uitestLog("UI-TEST SKIP (no GUI session, no screens)")
-                } else if wasPaused {
-                    uitestLog("UI-TEST SKIP (app was paused, presentation not attempted)")
                 } else if count > 0 && visible == count {
                     uitestLog("UI-TEST PASS (overlay presented on \(count) screen(s))")
                 } else {
@@ -874,7 +944,10 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate, UNUser
             return
         }
         guard overlayWindows.isEmpty else { return }
-        if UserDefaults.standard.bool(forKey: AppDefaults.resetOnIdle), idleSeconds() >= idleThreshold {
+        // No heads-up when the overlay is off: the scheduled break already
+        // notifies once, a second banner would double-notify one break.
+        guard overlayEnabled else { return }
+        if shouldSkipBreakForIdle(manual: false, resetOnIdle: UserDefaults.standard.bool(forKey: AppDefaults.resetOnIdle), idleSeconds: idleSeconds(), threshold: idleThreshold) {
             logger.info("Skipping heads-up: user idle. Resetting timer.")
             startTimer()
             updateMenuStates()
@@ -882,7 +955,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate, UNUser
         }
         let content = UNMutableNotificationContent()
         content.title = "Break in 30s"
-        content.body = "Look away soon. Start now or snooze."
+        content.body = "Look away soon. It starts on time unless you snooze."
         content.sound = .default
         content.categoryIdentifier = HeadsUp.categoryID
         let identifier = UUID().uuidString
@@ -896,8 +969,10 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate, UNUser
     }
 
     func clearHeadsUpState() {
+        let center = UNUserNotificationCenter.current()
         if let lastHeadsUpID {
-            UNUserNotificationCenter.current().removeDeliveredNotifications(withIdentifiers: [lastHeadsUpID])
+            center.removeDeliveredNotifications(withIdentifiers: [lastHeadsUpID])
+            center.removePendingNotificationRequests(withIdentifiers: [lastHeadsUpID])
         }
         lastHeadsUpID = nil
     }
@@ -907,6 +982,13 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate, UNUser
     func deferBreak(by extra: TimeInterval) {
         if !Thread.isMainThread {
             DispatchQueue.main.async { [weak self] in self?.deferBreak(by: extra) }
+            return
+        }
+        // A snooze tap while paused must not pretend to reschedule:
+        // startTimer() early-returns when paused, silently dropping it.
+        guard !isPaused else {
+            logger.warning("Snooze +\(Int(extra))s ignored: app is paused (manual=\(self.isManuallyPaused) camera=\(self.isAutoPausedForVideoCall))")
+            updateMenuStates()
             return
         }
         clearHeadsUpState()
@@ -923,9 +1005,13 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate, UNUser
 
     // MARK: - Idle detection
 
-    /// Seconds since the last keyboard/mouse event in the current session.
+    /// Seconds since the last keyboard/mouse/tablet event in this session.
+    /// Must query kCGAnyInputEventType (~0); .null measures null events and
+    /// misreports (Apple: "to get the elapsed time since the previous input
+    /// event — keyboard, mouse, or tablet — specify kCGAnyInputEventType").
     func idleSeconds() -> TimeInterval {
-        CGEventSource.secondsSinceLastEventType(.combinedSessionState, eventType: .null)
+        let anyInput = CGEventType(rawValue: ~UInt32(0)) ?? .null
+        return CGEventSource.secondsSinceLastEventType(.combinedSessionState, eventType: anyInput)
     }
 
     func startIdleMonitoring() {
@@ -935,18 +1021,28 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate, UNUser
             self?.checkIdleAndResetIfNeeded()
         }
         if let idleMonitor {
-            RunLoop.current.add(idleMonitor, forMode: .common)
+            RunLoop.main.add(idleMonitor, forMode: .common)
         }
     }
 
     /// While the user is away, keep postponing the break so it fires a full
     /// interval *after they return*, and never pops an overlay onto an empty desk.
+    /// Latched per idle episode: resets once when idleness begins, not every
+    /// 5s, so the countdown doesn't slide and the log doesn't spam.
+    var idleResetLatched = false
+
     func checkIdleAndResetIfNeeded() {
+        resumeScheduleIfPauseExpired(refreshManualPauseIfExpired())
         guard !isPaused else { return }
         guard UserDefaults.standard.bool(forKey: AppDefaults.resetOnIdle) else { return }
         guard overlayWindows.isEmpty else { return }
         let idle = idleSeconds()
-        guard idle >= idleThreshold else { return }
+        guard idle >= idleThreshold else {
+            idleResetLatched = false
+            return
+        }
+        guard !idleResetLatched else { return }
+        idleResetLatched = true
         logger.info("User idle for \(Int(idle))s — resetting break timer.")
         startTimer()
         updateMenuStates()
@@ -961,18 +1057,21 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate, UNUser
             self?.checkVideoCallState()
         }
         if let cameraUsageMonitor {
-            RunLoop.current.add(cameraUsageMonitor, forMode: .common)
+            RunLoop.main.add(cameraUsageMonitor, forMode: .common)
         }
     }
 
     func checkVideoCallState() {
-        refreshManualPauseIfExpired()
+        let pauseExpired = refreshManualPauseIfExpired()
 
         let autoPauseEnabled = UserDefaults.standard.bool(forKey: AppDefaults.autoPauseForCamera)
         if !autoPauseEnabled {
             if isAutoPausedForVideoCall {
                 isAutoPausedForVideoCall = false
+                logger.info("Camera auto-pause disabled, resuming")
                 applyPauseState()
+            } else {
+                resumeScheduleIfPauseExpired(pauseExpired)
             }
             updateMenuStates()
             return
@@ -981,12 +1080,16 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate, UNUser
         let isCameraRunning = isAnyCameraRunningCMIO() || isAnyCaptureDeviceInUse()
 
         guard isAutoPausedForVideoCall != isCameraRunning else {
+            resumeScheduleIfPauseExpired(pauseExpired)
             updateMenuStates()
             return
         }
         isAutoPausedForVideoCall = isCameraRunning
         if isAutoPausedForVideoCall {
+            logger.info("Camera in use — auto-pausing breaks")
             dismissOverlayAndRestoreFocus()
+        } else {
+            logger.info("Camera released — resuming breaks")
         }
         applyPauseState()
     }
@@ -996,8 +1099,8 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate, UNUser
             .builtInWideAngleCamera,
             .externalUnknown
         ]
-        discoveryDeviceTypes.append(.deskViewCamera)
         if #available(macOS 14.0, *) {
+            discoveryDeviceTypes.append(.deskViewCamera)
             discoveryDeviceTypes.append(.continuityCamera)
             discoveryDeviceTypes.append(.external)
         }
@@ -1106,18 +1209,30 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate, UNUser
         guard !overlayWindows.isEmpty || previouslyActiveApp != nil else { return }
 
         logger.info("Dismissing \(self.overlayWindows.count) overlay window(s)")
-        overlayWindows.forEach { $0.close() }
+        // Release the SwiftUI hosting views before closing: close() alone may
+        // not synchronously fire onDisappear, leaking per-window timers.
+        overlayWindows.forEach {
+            $0.contentView = nil
+            $0.close()
+        }
         overlayWindows.removeAll()
 
         let previous = previouslyActiveApp
         previouslyActiveApp = nil
 
+        // Capture before deactivating: deactivation itself can flip
+        // frontmostApplication and would force the hide path every time.
+        let stillOurs = NSWorkspace.shared.frontmostApplication?.bundleIdentifier == Bundle.main.bundleIdentifier
         NSApp.deactivate()
 
-        if let previous,
-           !previous.isTerminated,
-           previous.bundleIdentifier != Bundle.main.bundleIdentifier,
-           let bundleID = previous.bundleIdentifier {
+        // Only restore when the user is still sitting in our overlay. If they
+        // Cmd-Tabbed elsewhere mid-break, yanking them back would steal focus
+        // from where they chose to be.
+        if stillOurs,
+            let previous,
+            !previous.isTerminated,
+            previous.bundleIdentifier != Bundle.main.bundleIdentifier,
+            let bundleID = previous.bundleIdentifier {
             logger.info("Restoring focus to \(bundleID)")
             DispatchQueue.main.async {
                 if !previous.isTerminated {
@@ -1125,6 +1240,9 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate, UNUser
                 }
             }
         } else {
+            if !stillOurs {
+                logger.info("Focus restore skipped: user already moved to another app")
+            }
             NSApp.hide(nil)
         }
     }
@@ -1141,7 +1259,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate, UNUser
     }
 
     private func presentOverlayNow() {
-        assert(Thread.isMainThread, "presentOverlayNow must run on the main thread")
+        dispatchPrecondition(condition: .onQueue(.main))
 
         let screenCount = NSScreen.screens.count
         let idle = idleSeconds()
@@ -1158,11 +1276,21 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate, UNUser
             }
         }
 
-        self.overlayWindows.forEach { $0.close() }
+        self.overlayWindows.forEach {
+            $0.contentView = nil
+            $0.close()
+        }
         self.overlayWindows.removeAll()
 
         let enabled = UserDefaults.standard.bool(forKey: AppDefaults.motivationEnabled)
         let quotes = enabled ? Quotes.getActiveQuotes() : []
+        // One quote per break so all screens agree (views must not each roll).
+        let breakQuotes: [String]
+        if let quote = quotes.randomElement() {
+            breakQuotes = [quote]
+        } else {
+            breakQuotes = []
+        }
         let isStrict = UserDefaults.standard.bool(forKey: AppDefaults.strictMode)
         let maxSkips = UserDefaults.standard.integer(forKey: AppDefaults.maxSkipsPerHour)
         let breakDuration = self.breakDurationSeconds
@@ -1175,17 +1303,22 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate, UNUser
             let window = OverlayWindow(frame: screen.frame)
             let view = OverlayView(
                 onDismiss: { [weak self] in self?.dismissOverlayAndRestoreFocus() },
-                onSkipAction: { [weak self] in self?.skipTimestamps.append(Date()) },
+                onSkipAction: { [weak self] in
+                    self?.skipTimestamps.append(Date())
+                    if let self {
+                        logger.info("Skip recorded (\(self.skipTimestamps.count) this hour window)")
+                    }
+                },
                 onSnoozeAction: { [weak self] in self?.snoozeBreakForFiveMinutes() },
-                quotes: quotes,
+                quotes: breakQuotes,
                 isStrict: isStrict,
                 canSkip: canSkip,
                 breakDuration: breakDuration
             )
             window.contentView = NSHostingView(rootView: view)
-            window.makeKeyAndOrderFront(nil)
-            // Ensure it floats above everything (proven pre-P0 ordering).
+            // Float above normal windows; set before ordering to avoid flicker.
             window.level = .floating
+            window.makeKeyAndOrderFront(nil)
             self.overlayWindows.append(window)
         }
 
@@ -1199,10 +1332,11 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate, UNUser
     func sendNotification() {
         let content = UNMutableNotificationContent()
         content.title = "Time to Blink!"
-        content.body = "Rest your eyes for 20 seconds."
+        content.body = "Rest your eyes for \(breakDurationSeconds) seconds."
         content.sound = .default
         let request = UNNotificationRequest(identifier: UUID().uuidString, content: content, trigger: nil)
         UNUserNotificationCenter.current().add(request)
+        logger.info("Sent fallback notification (duration \(self.breakDurationSeconds)s)")
     }
 }
 
@@ -1327,7 +1461,6 @@ struct OverlayView: View {
                         }
                         .buttonStyle(.plain)
                         .foregroundStyle(.secondary)
-                        .keyboardShortcut(.cancelAction)
 
                         Button {
                             onSnoozeAction()
@@ -1338,7 +1471,6 @@ struct OverlayView: View {
                         }
                         .buttonStyle(.borderedProminent)
                         .clipShape(Capsule())
-                        .keyboardShortcut("s", modifiers: [])
                     }
                     .padding(.top, 4)
                 } else {

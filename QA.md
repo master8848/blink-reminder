@@ -19,11 +19,13 @@ Verify each item on a real Mac before shipping a release build.
 ## Menu / scheduling
 - [ ] Menu bar shows the eye icon only; countdown appears in the opened menu.
 - [ ] Menu shows "Next break in MM:SS" snapshot when opened.
-- [ ] Menu shows "Paused" / "Paused (Xm left)" / "Paused (Video Call)" / "Idle" correctly.
+- [ ] Menu shows "Paused" / "Paused (Xm left)" / "Paused (Video Call)" correctly.
 - [ ] Pause / Resume toggles the schedule.
 - [ ] Pause For > 15m / 30m / 1h pauses and auto-resumes after the duration.
 - [ ] Changing Interval restarts the countdown.
+- [ ] Interval and Use Screen Overlay choices survive a relaunch.
 - [ ] Changing Break Duration applies to the next overlay.
+- [ ] Sleep preserves remaining time (wake resumes, doesn't restart full interval).
 
 ## Sensors
 - [ ] Camera on pauses the timer ("Paused (Video Call)"); camera off resumes.
