@@ -136,11 +136,10 @@ struct Quotes {
 
 // MARK: - AppDelegate
 
-final class AppDelegate: NSObject, NSApplicationDelegate, UNUserNotificationCenterDelegate {
+final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate, UNUserNotificationCenterDelegate {
     var statusItem: NSStatusItem?
     var timer: Timer?
     var headsUpTimer: Timer?
-    var menuTickTimer: Timer?
     var cameraUsageMonitor: Timer?
     var idleMonitor: Timer?
     var manualPauseResumeTimer: Timer?
@@ -202,7 +201,6 @@ final class AppDelegate: NSObject, NSApplicationDelegate, UNUserNotificationCent
         requestNotificationPermission()
         startVideoCallMonitoring()
         startIdleMonitoring()
-        startMenuTick()
 
         let workspaceCenter = NSWorkspace.shared.notificationCenter
         workspaceCenter.addObserver(self, selector: #selector(suspendTimer), name: NSWorkspace.willSleepNotification, object: nil)
@@ -228,8 +226,6 @@ final class AppDelegate: NSObject, NSApplicationDelegate, UNUserNotificationCent
         timer = nil
         headsUpTimer?.invalidate()
         headsUpTimer = nil
-        menuTickTimer?.invalidate()
-        menuTickTimer = nil
         cameraUsageMonitor?.invalidate()
         cameraUsageMonitor = nil
         idleMonitor?.invalidate()
@@ -286,13 +282,14 @@ final class AppDelegate: NSObject, NSApplicationDelegate, UNUserNotificationCent
 
     func setupMenu() {
         let menu = NSMenu()
+        menu.delegate = self
 
         let version = Bundle.main.infoDictionary?["CFBundleShortVersionString"] as? String ?? ""
         let headerItem = NSMenuItem(title: "Blink Reminder v\(version)", action: nil, keyEquivalent: "")
         headerItem.isEnabled = false
         menu.addItem(headerItem)
 
-        // Live countdown item (tag 9001). Updated every second by menuTickTimer.
+        // Countdown item (tag 9001). Refreshed on menu open (menuWillOpen); no background polling.
         let countdownItem = NSMenuItem(title: "Next break in --:--", action: nil, keyEquivalent: "")
         countdownItem.tag = 9001
         countdownItem.isEnabled = false
@@ -591,21 +588,15 @@ final class AppDelegate: NSObject, NSApplicationDelegate, UNUserNotificationCent
         }
     }
 
-    // MARK: - Live countdown (P0-1)
+    // MARK: - Countdown (on-demand; no background polling)
 
-    func startMenuTick() {
-        menuTickTimer?.invalidate()
-        menuTickTimer = Timer.scheduledTimer(withTimeInterval: 1, repeats: true) { [weak self] _ in
-            self?.tickMenuCountdown()
-        }
-        if let menuTickTimer {
-            RunLoop.current.add(menuTickTimer, forMode: .common)
-        }
-    }
-
-    func tickMenuCountdown() {
+    /// NSMenuDelegate: refresh the countdown snapshot each time the menu opens.
+    /// countdownTitle() computes from nextFireDate on demand, so no repeating
+    /// 1s timer runs while the app idles.
+    func menuWillOpen(_ menu: NSMenu) {
         refreshManualPauseIfExpired()
         refreshCountdownItem()
+        updateMenuStates()
     }
 
     func countdownTitle() -> String {
@@ -747,6 +738,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, UNUserNotificationCent
     // MARK: - Break scheduling (single-shot + heads-up)
 
     func startTimer(withDelay delay: TimeInterval? = nil) {
+        refreshManualPauseIfExpired()
         timer?.invalidate()
         timer = nil
         headsUpTimer?.invalidate()
@@ -780,20 +772,28 @@ final class AppDelegate: NSObject, NSApplicationDelegate, UNUserNotificationCent
     }
 
     @objc func triggerBreak() {
-        guard !isPaused else { return }
+        refreshManualPauseIfExpired()
+        guard !isPaused else {
+            logger.info("triggerBreak skipped: paused (manual=\(self.isManuallyPaused) camera=\(self.isAutoPausedForVideoCall))")
+            return
+        }
         if UserDefaults.standard.bool(forKey: AppDefaults.resetOnIdle), idleSeconds() >= idleThreshold {
-            logger.info("Skipping break: user idle (\(Int(self.idleSeconds()))s). Resetting timer.")
+            logger.info("Skipping break: user idle (\(Int(self.idleSeconds()))s >= \(Int(self.idleThreshold))s). Resetting timer.")
             startTimer()
             updateMenuStates()
             return
         }
         clearHeadsUpState()
         if overlayEnabled {
+            logger.info("triggerBreak: presenting overlay")
             showOverlay()
         } else {
+            logger.info("triggerBreak: overlay disabled, sending notification")
             sendNotification()
         }
-        // Schedule the next cycle so the countdown keeps matching the timer.
+        // Schedule the next cycle AFTER the overlay exists (showOverlay is
+        // synchronous on the main thread). startTimer only touches
+        // timer/headsUpTimer/nextFireDate — it never invalidates overlayWindows.
         startTimer()
         updateMenuStates()
     }
@@ -801,7 +801,11 @@ final class AppDelegate: NSObject, NSApplicationDelegate, UNUserNotificationCent
     // MARK: - 30s heads-up with snooze (P0-2)
 
     func sendHeadsUp() {
-        guard !isPaused else { return }
+        refreshManualPauseIfExpired()
+        guard !isPaused else {
+            logger.info("Heads-up skipped: paused")
+            return
+        }
         guard overlayWindows.isEmpty else { return }
         if UserDefaults.standard.bool(forKey: AppDefaults.resetOnIdle), idleSeconds() >= idleThreshold {
             logger.info("Skipping heads-up: user idle. Resetting timer.")
@@ -1040,6 +1044,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, UNUserNotificationCent
         }
         guard !overlayWindows.isEmpty || previouslyActiveApp != nil else { return }
 
+        logger.info("Dismissing \(self.overlayWindows.count) overlay window(s)")
         overlayWindows.forEach { $0.close() }
         overlayWindows.removeAll()
 
@@ -1063,47 +1068,69 @@ final class AppDelegate: NSObject, NSApplicationDelegate, UNUserNotificationCent
         }
     }
 
+    /// Presents the break overlay. Runs synchronously when already on the main
+    /// thread so the windows exist before triggerBreak() schedules the next
+    /// cycle; hops to main only when called from a background thread.
     func showOverlay() {
-        DispatchQueue.main.async { [weak self] in
-            guard let self else { return }
+        if Thread.isMainThread {
+            presentOverlayNow()
+        } else {
+            DispatchQueue.main.async { [weak self] in self?.presentOverlayNow() }
+        }
+    }
 
-            if self.overlayWindows.isEmpty {
-                if let front = NSWorkspace.shared.frontmostApplication,
-                   front.bundleIdentifier != Bundle.main.bundleIdentifier {
-                    self.previouslyActiveApp = front
-                }
+    private func presentOverlayNow() {
+        assert(Thread.isMainThread, "presentOverlayNow must run on the main thread")
+
+        let screenCount = NSScreen.screens.count
+        let idle = idleSeconds()
+        logger.info("showOverlay: screens=\(screenCount) overlayEnabled=\(self.overlayEnabled) paused=\(self.isPaused) idle=\(Int(idle))s threshold=\(Int(self.idleThreshold))s")
+        guard screenCount > 0 else {
+            logger.error("showOverlay: no screens available, cannot present overlay")
+            return
+        }
+
+        if self.overlayWindows.isEmpty {
+            if let front = NSWorkspace.shared.frontmostApplication,
+               front.bundleIdentifier != Bundle.main.bundleIdentifier {
+                self.previouslyActiveApp = front
             }
+        }
 
-            self.overlayWindows.forEach { $0.close() }
-            self.overlayWindows.removeAll()
+        self.overlayWindows.forEach { $0.close() }
+        self.overlayWindows.removeAll()
 
-            let enabled = UserDefaults.standard.bool(forKey: AppDefaults.motivationEnabled)
-            let quotes = enabled ? Quotes.getActiveQuotes() : []
-            let isStrict = UserDefaults.standard.bool(forKey: AppDefaults.strictMode)
-            let maxSkips = UserDefaults.standard.integer(forKey: AppDefaults.maxSkipsPerHour)
-            let breakDuration = self.breakDurationSeconds
+        let enabled = UserDefaults.standard.bool(forKey: AppDefaults.motivationEnabled)
+        let quotes = enabled ? Quotes.getActiveQuotes() : []
+        let isStrict = UserDefaults.standard.bool(forKey: AppDefaults.strictMode)
+        let maxSkips = UserDefaults.standard.integer(forKey: AppDefaults.maxSkipsPerHour)
+        let breakDuration = self.breakDurationSeconds
 
-            let now = Date()
-            self.skipTimestamps = self.skipTimestamps.filter { now.timeIntervalSince($0) < 3600 }
-            let canSkip = (maxSkips == -1) || (self.skipTimestamps.count < maxSkips)
+        let now = Date()
+        self.skipTimestamps = self.skipTimestamps.filter { now.timeIntervalSince($0) < 3600 }
+        let canSkip = (maxSkips == -1) || (self.skipTimestamps.count < maxSkips)
 
-            for screen in NSScreen.screens {
-                let window = OverlayWindow(frame: screen.frame)
-                let view = OverlayView(
-                    onDismiss: { [weak self] in self?.dismissOverlayAndRestoreFocus() },
-                    onSkipAction: { [weak self] in self?.skipTimestamps.append(Date()) },
-                    onSnoozeAction: { [weak self] in self?.snoozeBreakForFiveMinutes() },
-                    quotes: quotes,
-                    isStrict: isStrict,
-                    canSkip: canSkip,
-                    breakDuration: breakDuration
-                )
-                window.contentView = NSHostingView(rootView: view)
-                window.makeKeyAndOrderFront(nil)
-                self.overlayWindows.append(window)
-            }
+        for screen in NSScreen.screens {
+            let window = OverlayWindow(frame: screen.frame)
+            let view = OverlayView(
+                onDismiss: { [weak self] in self?.dismissOverlayAndRestoreFocus() },
+                onSkipAction: { [weak self] in self?.skipTimestamps.append(Date()) },
+                onSnoozeAction: { [weak self] in self?.snoozeBreakForFiveMinutes() },
+                quotes: quotes,
+                isStrict: isStrict,
+                canSkip: canSkip,
+                breakDuration: breakDuration
+            )
+            window.contentView = NSHostingView(rootView: view)
+            window.makeKeyAndOrderFront(nil)
+            window.orderFrontRegardless()
+            self.overlayWindows.append(window)
+        }
 
-            NSApp.activate(ignoringOtherApps: true)
+        NSApp.activate(ignoringOtherApps: true)
+        logger.info("Overlay shown on \(self.overlayWindows.count) window(s)")
+        if self.overlayWindows.isEmpty {
+            logger.error("showOverlay: no overlay windows created despite \(screenCount) screen(s)")
         }
     }
 
@@ -1275,12 +1302,14 @@ struct OverlayView: View {
             if motivationText.isEmpty {
                 motivationText = quotes.randomElement() ?? ""
             }
+            logger.info("OverlayView shown, countdown from \(self.total)s")
             connectedTimer = timer.connect()
         }
         .onDisappear {
             isActive = false
             connectedTimer?.cancel()
             connectedTimer = nil
+            logger.info("OverlayView dismissed")
         }
         .onReceive(timer) { _ in
             guard isActive else { return }
@@ -1288,6 +1317,7 @@ struct OverlayView: View {
             if left > 0 {
                 left -= 1
                 timeLeft = left
+                logger.debug("Overlay countdown: \(left)s left")
                 if left <= 0 {
                     onDismiss()
                 }
