@@ -53,6 +53,9 @@ brew update && brew upgrade --cask blink-reminder
 **Note:** The GitHub Action `release.yml` automatically extracts the version from the git tag (e.g., `v1.0.3` -> `1.0.3`) and passes it to `build.sh`.
 
 ## Recent Changes
+- v1.1.0: Idle-aware scheduling (`CGEventSource` idle check + 5s monitor, `Reset Timer When Idle` toggle + `Idle Threshold` submenu, skip-and-reset when idle).
+- v1.1.0: Focus restore (`previouslyActiveApp` capture + `dismissOverlayAndRestoreFocus()`, screen-saver window level, `canBecomeKey/Main` overrides).
+- v1.1.0: Modernize — `OSLog` logging, type-safe `AppDefaults` keys, `ignoresSafeArea`, weak captures, universal (arm64+x86_64) build, minimum macOS 13, `SMAppService` without legacy fallbacks.
 - Updated menu bar to display app version (e.g., "Blink Reminder v1.0.2").
 - Updated `build.sh` to accept version number as an argument.
 - Updated GitHub Actions to pass tag version to build script.

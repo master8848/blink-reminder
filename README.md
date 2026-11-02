@@ -6,6 +6,8 @@ A minimal, native macOS menu bar application designed to reduce digital eye stra
 
 - **Menu Bar Workflow:** Runs unobtrusively in your menu bar.
 - **Smart Overlay:** A full-screen, dimming overlay guides you through a 20-second break.
+- **Idle-aware scheduling (v1.1.0):** Uses `CGEventSource` to measure keyboard/mouse idle time. If you've been away longer than the Idle Threshold (default 60s, configurable), the break is skipped and the timer resets — your eyes already rested. Toggle via **Reset Timer When Idle**. No overlay ever pops onto an empty desk.
+- **Focus restore (v1.1.0):** Captures the previously active app before a break and returns focus to it after Skip or countdown ends (like Time Out / Stretchly). Overlay now uses screen-saver window level so it stays above fullscreen apps.
 - **Pause/Resume:** Easily pause reminders during meetings or movies.
 - **Customizable Intervals:** Choose from 20, 10, or 5-minute intervals.
 - **Notification Mode:** Fallback to system notifications if you prefer not to use the overlay.
