@@ -97,5 +97,9 @@ chmod +x "$MACOS/$APP_NAME"
 
 codesign --force --deep --sign - "$APP_BUNDLE"
 
+rm -f "$APP_NAME.zip"
+zip -qr "$APP_NAME.zip" "$APP_BUNDLE"
+
 echo "Build complete: $APP_BUNDLE (v$VERSION)"
 lipo -info "$MACOS/$APP_NAME"
+shasum -a 256 "$APP_NAME.zip"
