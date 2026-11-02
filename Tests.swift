@@ -44,6 +44,11 @@ func canSkip(maxSkips: Int, recentCount: Int) -> Bool {
     (maxSkips == -1) || (recentCount < maxSkips)
 }
 
+/// Mirrors shouldSkipBreakForIdle() in BlinkReminder.swift.
+func shouldSkipBreakForIdle(manual: Bool, resetOnIdle: Bool, idleSeconds: TimeInterval, threshold: TimeInterval) -> Bool {
+    !manual && resetOnIdle && idleSeconds >= threshold
+}
+
 /// Mirrors AppDelegate.idleThreshold default resolution.
 func resolveIdleThreshold(stored: Double) -> Double {
     stored > 0 ? stored : 60
@@ -92,6 +97,12 @@ checkEqual(resolveIdleThreshold(stored: 0), 60, "idleThreshold default 60s")
 checkEqual(resolveIdleThreshold(stored: 120), 120, "idleThreshold stored respected")
 checkEqual(resolveBreakDuration(stored: 0), 20, "breakDuration default 20s")
 checkEqual(resolveBreakDuration(stored: 30), 30, "breakDuration stored respected")
+
+// 5. Idle-skip applies to scheduled fires only; manual triggers always present.
+checkEqual(shouldSkipBreakForIdle(manual: false, resetOnIdle: true, idleSeconds: 3600, threshold: 60), true, "scheduled idle skips")
+checkEqual(shouldSkipBreakForIdle(manual: false, resetOnIdle: true, idleSeconds: 10, threshold: 60), false, "scheduled active does not skip")
+checkEqual(shouldSkipBreakForIdle(manual: false, resetOnIdle: false, idleSeconds: 3600, threshold: 60), false, "idle reset off does not skip")
+checkEqual(shouldSkipBreakForIdle(manual: true, resetOnIdle: true, idleSeconds: 3600, threshold: 60), false, "manual never skips")
 
 // MARK: - Result
 

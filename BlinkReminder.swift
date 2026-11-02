@@ -10,6 +10,20 @@ import OSLog
 
 private let logger = Logger(subsystem: "com.agamtech.blinkreminder", category: "app")
 
+/// Pure decision helper (mirrored in Tests.swift): only a *scheduled* fire may be
+/// skipped for idleness. A manual trigger proves the user is present, so it
+/// always presents (unless paused).
+func shouldSkipBreakForIdle(manual: Bool, resetOnIdle: Bool, idleSeconds: TimeInterval, threshold: TimeInterval) -> Bool {
+    !manual && resetOnIdle && idleSeconds >= threshold
+}
+
+/// Unbuffered stdout write: print() block-buffers when redirected to a file,
+/// which loses output if the process is killed. The self-test must be visible.
+func uitestLog(_ message: String) {
+    print(message)
+    fflush(stdout)
+}
+
 private enum HeadsUp {
     static let categoryID = "BREAK_HEADSUP"
     static let startNowID = "START_NOW"
@@ -194,6 +208,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate, UNUser
         NSApp.setActivationPolicy(.accessory)
 
         statusItem = NSStatusBar.system.statusItem(withLength: NSStatusItem.variableLength)
+        statusItem?.button?.font = NSFont.monospacedDigitSystemFont(ofSize: NSFont.systemFontSize, weight: .regular)
         updateStatusIcon()
 
         setupMenu()
@@ -210,6 +225,10 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate, UNUser
 
         startTimer()
         logger.info("BlinkReminder launched. Interval: \(self.interval)s, resetOnIdle: \(UserDefaults.standard.bool(forKey: AppDefaults.resetOnIdle))")
+
+        if CommandLine.arguments.contains("--test-overlay") {
+            runOverlaySelfTest()
+        }
     }
 
     func applicationWillTerminate(_ notification: Notification) {
@@ -256,7 +275,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate, UNUser
             case HeadsUp.startNowID:
                 logger.info("Heads-up: Start now tapped")
                 self.clearHeadsUpState()
-                self.triggerBreak()
+                self.triggerBreakNow()
             case HeadsUp.snooze1mID:
                 logger.info("Heads-up: snooze +1m")
                 self.deferBreak(by: 60)
@@ -341,7 +360,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate, UNUser
         menu.addItem(pauseForMenu)
 
         menu.addItem(NSMenuItem(title: "Pause", action: #selector(togglePause(_:)), keyEquivalent: "p"))
-        menu.addItem(NSMenuItem(title: "Trigger Break Now", action: #selector(triggerBreak), keyEquivalent: "b"))
+        menu.addItem(NSMenuItem(title: "Trigger Break Now", action: #selector(triggerBreakNow), keyEquivalent: "b"))
 
         menu.addItem(NSMenuItem.separator())
 
@@ -610,9 +629,6 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate, UNUser
             return "Paused"
         }
         guard let nextFireDate else { return "Paused" }
-        if isCurrentlyIdle {
-            return "Idle"
-        }
         let remaining = max(0, Int(ceil(nextFireDate.timeIntervalSinceNow)))
         let minutes = remaining / 60
         let seconds = remaining % 60
@@ -622,6 +638,22 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate, UNUser
     func refreshCountdownItem() {
         guard let menu = statusItem?.menu, let item = menu.item(withTag: 9001) else { return }
         item.title = countdownTitle()
+    }
+
+    /// Menubar button shows the countdown (MM:SS), refreshed on every state
+    /// change and on the existing 2s sensor tick — no extra timer.
+    func refreshStatusTitle() {
+        guard let button = statusItem?.button else { return }
+        if isPaused {
+            button.title = ""
+            return
+        }
+        guard let nextFireDate else {
+            button.title = ""
+            return
+        }
+        let remaining = max(0, Int(ceil(nextFireDate.timeIntervalSinceNow)))
+        button.title = String(format: "%02d:%02d", remaining / 60, remaining % 60)
     }
 
     func updateMenuStates() {
@@ -705,6 +737,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate, UNUser
         }
 
         refreshCountdownItem()
+        refreshStatusTitle()
     }
 
     @objc func suspendTimer() {
@@ -771,17 +804,34 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate, UNUser
         refreshCountdownItem()
     }
 
+    /// Timer-fired break (scheduled path): may be skipped when paused or idle.
     @objc func triggerBreak() {
+        handleBreakFire(manual: false)
+    }
+
+    /// Manual break (menu item, heads-up action, self-test): restores the
+    /// pre-P0 behavior of always presenting — the interaction proves the user
+    /// is present, so paused/idle guards are bypassed.
+    @objc func triggerBreakNow() {
+        handleBreakFire(manual: true)
+    }
+
+    private func handleBreakFire(manual: Bool) {
         refreshManualPauseIfExpired()
-        guard !isPaused else {
-            logger.info("triggerBreak skipped: paused (manual=\(self.isManuallyPaused) camera=\(self.isAutoPausedForVideoCall))")
-            return
-        }
-        if UserDefaults.standard.bool(forKey: AppDefaults.resetOnIdle), idleSeconds() >= idleThreshold {
-            logger.info("Skipping break: user idle (\(Int(self.idleSeconds()))s >= \(Int(self.idleThreshold))s). Resetting timer.")
-            startTimer()
-            updateMenuStates()
-            return
+        if manual {
+            logger.info("Manual break trigger (paused/idle guards bypassed, idle=\(Int(self.idleSeconds()))s)")
+        } else {
+            guard !isPaused else {
+                logger.info("triggerBreak skipped: paused (manual=\(self.isManuallyPaused) camera=\(self.isAutoPausedForVideoCall))")
+                return
+            }
+            let idle = idleSeconds()
+            if shouldSkipBreakForIdle(manual: manual, resetOnIdle: UserDefaults.standard.bool(forKey: AppDefaults.resetOnIdle), idleSeconds: idle, threshold: idleThreshold) {
+                logger.info("Skipping break: user idle (\(Int(idle))s >= \(Int(self.idleThreshold))s). Resetting timer.")
+                startTimer()
+                updateMenuStates()
+                return
+            }
         }
         clearHeadsUpState()
         if overlayEnabled {
@@ -796,6 +846,39 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate, UNUser
         // timer/headsUpTimer/nextFireDate — it never invalidates overlayWindows.
         startTimer()
         updateMenuStates()
+    }
+
+    /// Headless UI self-test (`--test-overlay`): presents the overlay via the
+    /// manual path, reports windows/visible/screens to stdout, then quits.
+    /// Skips when there is no GUI session or the app is paused. Lets anyone
+    /// verify the overlay on a real Mac without build tools:
+    /// `/Applications/BlinkReminder.app/Contents/MacOS/BlinkReminder --test-overlay`
+    func runOverlaySelfTest() {
+        uitestLog("UI-TEST: starting overlay self-test")
+        logger.info("UI-TEST: starting overlay self-test")
+        DispatchQueue.main.asyncAfter(deadline: .now() + 1) { [weak self] in
+            guard let self else { return }
+            let screens = NSScreen.screens.count
+            let wasPaused = self.isPaused
+            uitestLog("UI-TEST: screens=\(screens) paused=\(wasPaused) overlayEnabled=\(self.overlayEnabled)")
+            self.triggerBreakNow()
+            DispatchQueue.main.asyncAfter(deadline: .now() + 3) { [weak self] in
+                guard let self else { return }
+                let count = self.overlayWindows.count
+                let visible = self.overlayWindows.filter { $0.isVisible }.count
+                uitestLog("UI-TEST: windows=\(count) visible=\(visible)")
+                if screens == 0 {
+                    uitestLog("UI-TEST SKIP (no GUI session, no screens)")
+                } else if wasPaused {
+                    uitestLog("UI-TEST SKIP (app was paused, presentation not attempted)")
+                } else if count > 0 && visible == count {
+                    uitestLog("UI-TEST PASS (overlay presented on \(count) screen(s))")
+                } else {
+                    uitestLog("UI-TEST FAIL (windows=\(count) visible=\(visible) screens=\(screens) paused=\(self.isPaused))")
+                }
+                NSApp.terminate(nil)
+            }
+        }
     }
 
     // MARK: - 30s heads-up with snooze (P0-2)
@@ -1123,7 +1206,8 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate, UNUser
             )
             window.contentView = NSHostingView(rootView: view)
             window.makeKeyAndOrderFront(nil)
-            window.orderFrontRegardless()
+            // Ensure it floats above everything (proven pre-P0 ordering).
+            window.level = .floating
             self.overlayWindows.append(window)
         }
 
@@ -1146,25 +1230,22 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate, UNUser
 
 // MARK: - Overlay Window
 
+// Window recipe restored from the pre-P0 working build: a nonactivating
+// floating panel ordered front per screen. (The P0 rewrite's borderless +
+// .screenSaver combo never presented.)
 final class OverlayWindow: NSPanel {
-    override var canBecomeKey: Bool { true }
-    override var canBecomeMain: Bool { true }
-
     init(frame: NSRect) {
         super.init(
             contentRect: frame,
-            styleMask: [.borderless],
+            styleMask: [.nonactivatingPanel, .borderless],
             backing: .buffered,
             defer: false
         )
-        isFloatingPanel = false
-        hidesOnDeactivate = false
-        isMovable = false
+        isFloatingPanel = true
         backgroundColor = .clear
         isOpaque = false
         hasShadow = false
-        level = .screenSaver
-        collectionBehavior = [.canJoinAllSpaces, .fullScreenAuxiliary, .stationary]
+        collectionBehavior = [.canJoinAllSpaces, .fullScreenAuxiliary]
     }
 }
 

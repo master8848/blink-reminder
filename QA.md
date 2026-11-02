@@ -3,7 +3,8 @@
 Verify each item on a real Mac before shipping a release build.
 
 ## Overlay
-- [ ] Menu > Trigger Break Now shows the overlay on all connected screens.
+- [ ] Menu > Trigger Break Now shows the overlay on all connected screens,
+      even when paused/idle (manual triggers bypass the paused/idle guards).
 - [ ] Waiting for the full interval fires the overlay automatically.
 - [ ] Heads-up notification > Start now shows the overlay.
 - [ ] Countdown runs 20 → 0 (or configured duration) then auto-dismisses.
@@ -15,6 +16,7 @@ Verify each item on a real Mac before shipping a release build.
 - [ ] Overlay appears above a fullscreen app.
 
 ## Menu / scheduling
+- [ ] Menu bar shows live MM:SS countdown next to the eye icon (blank when paused).
 - [ ] Menu shows "Next break in MM:SS" snapshot when opened.
 - [ ] Menu shows "Paused" / "Paused (Xm left)" / "Paused (Video Call)" / "Idle" correctly.
 - [ ] Pause / Resume toggles the schedule.
@@ -35,3 +37,7 @@ Verify each item on a real Mac before shipping a release build.
 ## Battery
 - [ ] No 1s background timer: only the 2s camera check and 5s idle check run
       while idle (verify with Activity Monitor / `log stream`).
+
+## UI self-test
+- [ ] `./BlinkReminder.app/Contents/MacOS/BlinkReminder --test-overlay`
+      prints `UI-TEST PASS` on a GUI Mac (`SKIP` when headless).
