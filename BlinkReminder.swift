@@ -208,7 +208,6 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate, UNUser
         NSApp.setActivationPolicy(.accessory)
 
         statusItem = NSStatusBar.system.statusItem(withLength: NSStatusItem.variableLength)
-        statusItem?.button?.font = NSFont.monospacedDigitSystemFont(ofSize: NSFont.systemFontSize, weight: .regular)
         updateStatusIcon()
 
         setupMenu()
@@ -640,22 +639,6 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate, UNUser
         item.title = countdownTitle()
     }
 
-    /// Menubar button shows the countdown (MM:SS), refreshed on every state
-    /// change and on the existing 2s sensor tick — no extra timer.
-    func refreshStatusTitle() {
-        guard let button = statusItem?.button else { return }
-        if isPaused {
-            button.title = ""
-            return
-        }
-        guard let nextFireDate else {
-            button.title = ""
-            return
-        }
-        let remaining = max(0, Int(ceil(nextFireDate.timeIntervalSinceNow)))
-        button.title = String(format: "%02d:%02d", remaining / 60, remaining % 60)
-    }
-
     func updateMenuStates() {
         guard let menu = statusItem?.menu else { return }
 
@@ -737,7 +720,6 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate, UNUser
         }
 
         refreshCountdownItem()
-        refreshStatusTitle()
     }
 
     @objc func suspendTimer() {
@@ -860,7 +842,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate, UNUser
             guard let self else { return }
             let screens = NSScreen.screens.count
             let wasPaused = self.isPaused
-            uitestLog("UI-TEST: screens=\(screens) paused=\(wasPaused) overlayEnabled=\(self.overlayEnabled)")
+            uitestLog("UI-TEST: screens=\(screens) paused=\(wasPaused) overlayEnabled=\(self.overlayEnabled) idle=\(Int(self.idleSeconds()))s threshold=\(Int(self.idleThreshold))s resetOnIdle=\(UserDefaults.standard.bool(forKey: AppDefaults.resetOnIdle))")
             self.triggerBreakNow()
             DispatchQueue.main.asyncAfter(deadline: .now() + 3) { [weak self] in
                 guard let self else { return }
@@ -943,11 +925,6 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate, UNUser
     /// Seconds since the last keyboard/mouse event in the current session.
     func idleSeconds() -> TimeInterval {
         CGEventSource.secondsSinceLastEventType(.combinedSessionState, eventType: .null)
-    }
-
-    var isCurrentlyIdle: Bool {
-        guard UserDefaults.standard.bool(forKey: AppDefaults.resetOnIdle) else { return false }
-        return idleSeconds() >= idleThreshold
     }
 
     func startIdleMonitoring() {

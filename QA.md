@@ -16,7 +16,7 @@ Verify each item on a real Mac before shipping a release build.
 - [ ] Overlay appears above a fullscreen app.
 
 ## Menu / scheduling
-- [ ] Menu bar shows live MM:SS countdown next to the eye icon (blank when paused).
+- [ ] Menu bar shows the eye icon only; countdown appears in the opened menu.
 - [ ] Menu shows "Next break in MM:SS" snapshot when opened.
 - [ ] Menu shows "Paused" / "Paused (Xm left)" / "Paused (Video Call)" / "Idle" correctly.
 - [ ] Pause / Resume toggles the schedule.
